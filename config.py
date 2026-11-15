@@ -30,7 +30,7 @@ def _get_float(name: str, default: float) -> float:
 class Settings:
     # Postgres:  postgresql+psycopg://loglens:loglens@db:5432/loglens
     DATABASE_URL: str = os.environ.get(
-        "DATABASE_URL", "sqlite:///./policy_assistant.db"
+        "DATABASE_URL", "sqlite:///./loglens.db"
     )
  
     # Authorization 
@@ -38,6 +38,11 @@ class Settings:
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = _get_int("ACCESS_TOKEN_EXPIRE_MINUTES", 60)
  
+    # Public signup stays OFF until isolation, rate limits and upload
+    # protections are implemented and tested. Demo/admin accounts are created
+    # from environment variables and do not need it.
+    SIGNUP_ENABLED: bool = _get_bool("SIGNUP_ENABLED", False)
+
     # Debug endpoints will stay OFF unless explicitly enabled.
     ENABLE_DEBUG_ENDPOINTS: bool = _get_bool("ENABLE_DEBUG_ENDPOINTS", False)
  
@@ -85,6 +90,22 @@ class Settings:
  
     
     CORS_ORIGINS: str = os.environ.get("CORS_ORIGINS", "")
+
+    # --- Free-tier budget (Neon Free is ~0.5 GB per project; check current limits) ---
+    # Soft cap on total database size. Uploads are refused above this.
+    DB_STORAGE_LIMIT_MB: int = _get_int("DB_STORAGE_LIMIT_MB", 400)
+    # Per-workspace caps so one workspace cannot use the whole budget.
+    MAX_LOG_ENTRIES_PER_WORKSPACE: int = _get_int("MAX_LOG_ENTRIES_PER_WORKSPACE", 100_000)
+    MAX_UPLOAD_MB: int = _get_int("MAX_UPLOAD_MB", 5)
+    MAX_LINES_PER_UPLOAD: int = _get_int("MAX_LINES_PER_UPLOAD", 50_000)
+    # Log rows older than this (by ingest time) are purged. 0 disables purging.
+    LOG_RETENTION_DAYS: int = _get_int("LOG_RETENTION_DAYS", 14)
+    RETENTION_INTERVAL_HOURS: int = _get_int("RETENTION_INTERVAL_HOURS", 6)
+
+    # --- Incident-to-log matching ---
+    LOG_WINDOW_BEFORE_MINUTES: int = _get_int("LOG_WINDOW_BEFORE_MINUTES", 15)
+    LOG_WINDOW_AFTER_MINUTES: int = _get_int("LOG_WINDOW_AFTER_MINUTES", 60)
+    MATCH_MAX_ROWS: int = _get_int("MATCH_MAX_ROWS", 5000)
  
     @property
     def is_postgres(self) -> bool:

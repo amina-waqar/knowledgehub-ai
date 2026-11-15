@@ -1,5 +1,5 @@
 # models.py
-from sqlalchemy import (Column, Integer, String, DateTime, ForeignKey, Text, Boolean, Float, Index,)
+from sqlalchemy import (Column, Integer, String, DateTime, ForeignKey, Text, Boolean, Float, Index, JSON, UniqueConstraint,)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -13,6 +13,37 @@ if settings.use_pgvector:
     EmbeddingType = Vector(settings.EMBEDDING_DIM)
 else:
     EmbeddingType = Text
+
+
+class Workspace(Base):
+    """
+    The data-isolation boundary. Incidents, uploaded logs and (later) alerts
+    belong to exactly one workspace, and every query is scoped to it.
+    """
+
+    __tablename__ = "workspaces"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    members = relationship(
+        "WorkspaceMember", back_populates="workspace", cascade="all, delete-orphan"
+    )
+
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+
+    id = Column(Integer, primary_key=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    role = Column(String, nullable=False, default="member")  # owner | member
+
+    workspace = relationship("Workspace", back_populates="members")
+    user = relationship("User")
+
+    __table_args__ = (UniqueConstraint("workspace_id", "user_id", name="uq_workspace_user"),)
 
 
 # Model table
@@ -33,6 +64,9 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     is_admin = Column(Boolean, default=False)
+    # Where this user's new incidents and uploads go. Nullable so rows that
+    # predate workspaces still load; migrations.py backfills it.
+    default_workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     #One user can upload many documents and potentially create many incidents
@@ -74,6 +108,14 @@ class Document(Base):
 
     uploader_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Workspace that owns this document. NULL = shared across the platform
+    # (admin-uploaded runbooks and demo data).
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True, index=True)
+    # Log uploads can be tied to the incident they were uploaded for.
+    incident_id = Column(Integer, ForeignKey("incidents.id"), nullable=True, index=True)
+    size_bytes = Column(Integer, nullable=True)
+    sha256 = Column(String(64), nullable=True)
 
     # Relationships
     uploader = relationship("User", back_populates="documents")
@@ -146,6 +188,10 @@ class Incident(Base):
     resolved_at = Column(DateTime(timezone=True), nullable=True)
     creator_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True, index=True)
+    service = Column(String, nullable=True)  # primary affected service, if known
+    source = Column(String, nullable=False, default="manual")  # manual | alert
+
     # Relationships
     #one user can have many incidents
     creator = relationship("User", back_populates="incidents")
@@ -183,9 +229,25 @@ class LogEntry(Base):
     numeric_value = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Structured metadata used by incident-to-log matching.
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=True)
+    service = Column(String, nullable=True)
+    trace_id = Column(String, nullable=True)
+    host = Column(String, nullable=True)
+    attributes = Column(JSON, nullable=True)
+
     # Relationships
     document = relationship("Document", back_populates="log_entries")
     incident = relationship("Incident", back_populates="log_entries")
+
+    # Deliberately few indexes: on Neon Free every index spends storage.
+    __table_args__ = (
+        Index("idx_logentry_ws_ts", "workspace_id", "timestamp"),
+        Index("idx_logentry_ws_svc_ts", "workspace_id", "service", "timestamp"),
+        Index("idx_logentry_trace", "trace_id"),
+        Index("idx_logentry_document", "document_id"),
+        Index("idx_logentry_created", "created_at"),  # retention purge
+    )
 
 
 # SECTION: Feedback Model

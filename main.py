@@ -1,13 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware  # connects origins (React dev server, FastAPI)
 from contextlib import asynccontextmanager
-from typing import Annotated, Optional
-from fastapi.middleware.cors import CORSMiddleware #to connect origins (react , Fastapi)
+from typing import Annotated, Optional, TYPE_CHECKING
+import hashlib
 import os
 import uuid
-import re  # for log parsing
+import re
 
 from database import (
     engine,
@@ -17,14 +16,22 @@ from database import (
     wait_for_database,
     ensure_pgvector_extension,
     create_vector_index,
+    database_size_mb,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, select, or_, insert
 from sqlalchemy.orm import Session
 import models
+import log_parsing
+import log_matching
+from log_sources import DatabaseLogSource
+from migrations import add_missing_columns, backfill_default_workspace
+from ratelimit import limiter, client_ip
+import retention
 
 from pypdf import PdfReader  # for PDF parsing
 
-from sentence_transformers import SentenceTransformer
+if TYPE_CHECKING:  # imported lazily so tests and tooling can load the app without torch
+    from sentence_transformers import SentenceTransformer
 import json
 import asyncio
 
@@ -120,17 +127,39 @@ async def lifespan(app: FastAPI):
     wait_for_database()
     ensure_pgvector_extension()
     Base.metadata.create_all(bind=engine)
+    add_missing_columns()          # columns/indexes added after first deploy
     create_vector_index()
     bootstrap_admin()
     bootstrap_demo_user()
+    backfill_default_workspace()   # puts pre-workspace users/incidents in a workspace
 
     # Warm the embedding model so the first upload is not slow.
     await asyncio.to_thread(get_embedding_model)
 
+    retention_task = asyncio.create_task(_retention_loop())
+
     print(f"[startup] DB: {settings.DATABASE_URL.split('@')[-1]}")
     print(f"[startup] pgvector: {settings.use_pgvector}")
     print(f"[startup] LLM provider: {settings.LLM_PROVIDER}")
-    yield
+    print(f"[startup] signup enabled: {settings.SIGNUP_ENABLED}")
+    print(f"[startup] log retention: {settings.LOG_RETENTION_DAYS} days")
+    try:
+        yield
+    finally:
+        retention_task.cancel()
+
+
+async def _retention_loop() -> None:
+    """Purge expired logs shortly after startup and then on a timer."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            result = await asyncio.to_thread(retention.purge_old_logs)
+            if result.get("entries_deleted"):
+                print(f"[retention] {result}")
+        except Exception as exc:  # noqa: BLE001 - never let housekeeping crash the app
+            print(f"[retention] failed: {exc}")
+        await asyncio.sleep(max(1, settings.RETENTION_INTERVAL_HOURS) * 3600)
 
 
 app = FastAPI(
@@ -140,22 +169,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware( 
+_cors_origins = ["http://localhost:5173"] + settings.cors_origin_list  # 5173 = React dev server
+app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  #allowing React development 
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-if settings.cors_origin_list:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origin_list,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
 # ensuring upload directory exists
 UPLOAD_DIR = "uploaded_files"
@@ -168,9 +189,10 @@ DbSessionDep = Annotated[Session, Depends(get_database)]
 #Pydantic Schemas (for requests/responses)
 
 class UserCreate(BaseModel):
-    username: str
+    username: str = Field(..., min_length=3, max_length=40, pattern=r"^[A-Za-z0-9_.\-]+$")
     email: EmailStr
-    password: str
+    # bcrypt ignores bytes past 72, so cap there rather than silently truncate.
+    password: str = Field(..., min_length=10, max_length=72)
 
 
 class UserLogin(BaseModel):
@@ -193,6 +215,10 @@ class IncidentCreate(BaseModel):
     description: Optional[str] = None
     severity: Optional[str] = None
     status: str = "open"
+    # When the incident began. Anchors the log search window. Optional.
+    started_at: Optional[datetime] = None
+    # Primary affected service, matched against the `service` of log lines.
+    service: Optional[str] = Field(None, max_length=100)
 
 
 @app.get("/health")
@@ -204,6 +230,7 @@ def health_check():
         "pgvector": settings.use_pgvector,
         "llm_provider": settings.LLM_PROVIDER,
         "embedding_model": settings.EMBEDDING_MODEL,
+        "signup_enabled": settings.SIGNUP_ENABLED,
     }
 
 
@@ -216,16 +243,6 @@ async def health_check_llm():
     endpoint is unreachable, and you want to know which one is broken.
     """
     return await llm.health_check()
-
-@app.get("/hello")
-def hello(name: str = "there"):
-    """
-    Adding a simple example endpoint.
-    Query Param: name, response: "there" by default.
-    Returns a JSON greeting.
-    """
-    message = f"Hello, {name}! Welcome to the LogLens AI API."
-    return JSONResponse(content={"message": message})
 
 # SECTION: Password Hashing Utilities (NEW)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -355,13 +372,20 @@ async def get_current_admin(
 
 # SECTION: Auth Endpoints
 @app.post("/auth/signup", status_code=status.HTTP_201_CREATED)
-def signup(user_data: UserCreate, db: DbSessionDep):
+def signup(user_data: UserCreate, db: DbSessionDep, request: Request):
     """
-    Create a new user account.
+    Create a new user account with its own private workspace.
 
-    NOTE: For now, this is open; in a real company this would be restricted
-    (e.g., only admins can create users, or via SSO).
+    Disabled unless SIGNUP_ENABLED=true. It stays off until isolation, rate
+    limits and upload protections have been verified. New users are never admins.
     """
+    if not settings.SIGNUP_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Public signup is currently disabled.",
+        )
+    limiter.check(f"signup:{client_ip(request)}", limit=5, window_seconds=3600)
+
     # Check if username or email already exists
     existing_user = (
         db.query(models.User)
@@ -388,6 +412,15 @@ def signup(user_data: UserCreate, db: DbSessionDep):
     )
 
     db.add(new_user)
+    db.flush()
+
+    # Every signup gets its own workspace: the isolation boundary.
+    workspace = models.Workspace(name=f"{new_user.username}'s workspace")
+    db.add(workspace)
+    db.flush()
+    db.add(models.WorkspaceMember(workspace_id=workspace.id, user_id=new_user.id, role="owner"))
+    new_user.default_workspace_id = workspace.id
+
     db.commit()
     db.refresh(new_user)
 
@@ -400,13 +433,15 @@ def signup(user_data: UserCreate, db: DbSessionDep):
     }
 
 @app.post("/auth/login", response_model=TokenResponse)
-def login(form_data: UserLogin, db: DbSessionDep):
+def login(form_data: UserLogin, db: DbSessionDep, request: Request):
     """
     Log in a user and return a JWT access token.
 
     In a more 'OAuth2' style implementation, you'd accept form-encoded data using
     OAuth2PasswordRequestForm, but here we keep it simple with JSON.
     """
+    limiter.check(f"login:{client_ip(request)}", limit=10, window_seconds=60)
+
     user = get_user_by_username(db, form_data.username)
     if not user:
         raise HTTPException(
@@ -442,7 +477,43 @@ def read_current_user(
         "username": current_user.username,
         "email": current_user.email,
         "is_admin": current_user.is_admin,
+        "workspace_id": current_user.default_workspace_id,
     }
+
+
+# SECTION: Workspace isolation helpers
+def require_workspace(user: models.User) -> int:
+    if user.default_workspace_id is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No workspace assigned.")
+    return user.default_workspace_id
+
+
+def get_incident_for_user(db: Session, incident_id: int, user: models.User) -> models.Incident:
+    """
+    Fetch an incident the user may see, or 404.
+
+    Other workspaces' incidents return 404, not 403, so ids are not
+    discoverable. Platform admins can open any incident.
+    """
+    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    if incident is None or (
+        not user.is_admin and incident.workspace_id != user.default_workspace_id
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found.")
+    return incident
+
+
+def visible_documents(db: Session, user: models.User):
+    """Documents a user may see: shared ones (no workspace) plus their workspace's."""
+    q = db.query(models.Document)
+    if user.is_admin:
+        return q
+    return q.filter(
+        or_(
+            models.Document.workspace_id.is_(None),
+            models.Document.workspace_id == user.default_workspace_id,
+        )
+    )
 
 
 @app.post("/incidents", status_code=status.HTTP_201_CREATED)
@@ -452,12 +523,17 @@ def create_incident(
     current_user: Annotated[models.User, Depends(get_current_user)],
 ):
     """Create an incident. Replaces the old unauthenticated debug endpoint."""
+    workspace_id = require_workspace(current_user)
     incident = models.Incident(
         title=payload.title,
         description=payload.description,
         severity=payload.severity,
         status=payload.status or models.IncidentStatus.OPEN,
         creator_id=current_user.id,
+        workspace_id=workspace_id,
+        service=(payload.service or "").strip() or None,
+        started_at=log_matching.as_utc(payload.started_at) or datetime.now(timezone.utc),
+        source="manual",
     )
     db.add(incident)
     db.commit()
@@ -471,9 +547,11 @@ def list_incidents(
     current_user: Annotated[models.User, Depends(get_current_user)],
     limit: int = 50,
 ):
+    q = db.query(models.Incident)
+    if not current_user.is_admin:
+        q = q.filter(models.Incident.workspace_id == current_user.default_workspace_id)
     incidents = (
-        db.query(models.Incident)
-        .order_by(models.Incident.created_at.desc())
+        q.order_by(models.Incident.created_at.desc())
         .limit(min(limit, 200))
         .all()
     )
@@ -486,10 +564,7 @@ def get_incident(
     db: DbSessionDep,
     current_user: Annotated[models.User, Depends(get_current_user)],
 ):
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
-    if not incident:
-        raise HTTPException(status_code=404, detail="Incident not found.")
-    return _incident_to_dict(incident)
+    return _incident_to_dict(get_incident_for_user(db, incident_id, current_user))
 
 
 def _incident_to_dict(i: models.Incident) -> dict:
@@ -501,6 +576,10 @@ def _incident_to_dict(i: models.Incident) -> dict:
         "severity": i.severity,
         "created_at": i.created_at.isoformat() if i.created_at else None,
         "creator_id": i.creator_id,
+        "service": i.service,
+        "started_at": i.started_at.isoformat() if i.started_at else None,
+        "resolved_at": i.resolved_at.isoformat() if i.resolved_at else None,
+        "source": i.source,
     }
 
 
@@ -511,7 +590,7 @@ def list_documents(
     type: Optional[str] = None,
 ):
     """List uploaded documents, optionally filtered by type (log / runbook)."""
-    q = db.query(models.Document)
+    q = visible_documents(db, current_user)
     if type:
         q = q.filter(models.Document.type == type)
     docs = q.order_by(models.Document.uploaded_at.desc()).limit(200).all()
@@ -573,65 +652,12 @@ def detect_document_type(file: UploadFile) -> str:
     return models.DocumentType.OTHER
 
 
-# SECTION: Simple log line parser
-LOG_LINE_REGEX = re.compile(
-    r"^(?P<timestamp>\S+)\s+(?P<level>[A-Z]+)\s+(?P<message>.+)$"
-)
-
-
-def parse_log_line(line: str) -> dict:
-    """
-    Parsing a single log line into structured data.
-    Expected format (simple style):
-      2024-06-01T10:42:11Z INFO User 123 logged in
-
-    Returns a dict with keys:
-      - timestamp (datetime or None)
-      - level (str or None)
-      - message (str)
-      - raw (str)
-    """
-    line = line.strip()
-    if not line:
-        return {}
-
-    match = LOG_LINE_REGEX.match(line)
-    if not match:
-        # If it doesn't match the simple pattern,
-        # treat the whole line as message
-        return {
-            "timestamp": None,
-            "level": None,
-            "message": line,
-            "raw": line,
-        }
-
-    ts_str = match.group("timestamp")
-    level = match.group("level")
-    message = match.group("message")
-
-    # parsing timestamp
-    ts = None
-    try:
-        # to handle ISO 8601-like timestamps such as 2024-06-01T10:42:11Z
-        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except Exception:
-        pass
-
-    return {
-        "timestamp": ts,
-        "level": level,
-        "message": message,
-        "raw": line,
-    }
-
-
 # SECTION: Embedding Model Initialization
 # Global variable to hold the embedding model
-embedding_model: Optional[SentenceTransformer] = None
+embedding_model: Optional["SentenceTransformer"] = None
 
 
-def get_embedding_model() -> SentenceTransformer:
+def get_embedding_model() -> "SentenceTransformer":
     """
     Lazy-load the SentenceTransformer model.
     We only load it once and reuse it to avoid expensive reloads.
@@ -640,6 +666,8 @@ def get_embedding_model() -> SentenceTransformer:
     if embedding_model is None:
         # Load a small, fast model suitable for CPU and local development.
         # This model is good for general-purpose sentence embeddings.
+        from sentence_transformers import SentenceTransformer
+
         print(f"Loading SentenceTransformer model: {settings.EMBEDDING_MODEL} ...")
         embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL)
         print("Model loaded.")
@@ -841,114 +869,6 @@ def retrieve_relevant_chunks(
 
 
 
-def retrieve_relevant_log_patterns(
-    db: Session,
-    query: str,
-    incident: models.Incident,
-    top_k: int = 5,
-) -> list[dict]:
-    """
-    Find related historical log patterns for the current incident.
-
-    This is intentionally lightweight: it groups repeated uploaded log messages
-    and ranks them by keyword overlap, severity, and frequency. Runbooks remain
-    the primary grounded source; logs are supporting historical evidence.
-    """
-    search_text = " ".join(
-        [
-            query,
-            incident.title or "",
-            incident.description or "",
-        ]
-    ).lower()
-
-    stop_words = {
-        "the", "a", "an", "and", "or", "is", "are", "was", "were",
-        "to", "of", "in", "on", "for", "with", "what", "why", "how",
-        "do", "does", "did", "this", "that", "it", "my", "our",
-    }
-
-    search_terms = {
-        word
-        for word in re.findall(r"[a-zA-Z0-9_-]+", search_text)
-        if len(word) >= 3 and word not in stop_words
-    }
-
-    if not search_terms:
-        return []
-
-    rows = (
-        db.query(
-            models.LogEntry.message,
-            models.LogEntry.level,
-            models.Document.id.label("document_id"),
-            models.Document.title.label("document_title"),
-            func.count(models.LogEntry.id).label("occurrence_count"),
-            func.max(models.LogEntry.timestamp).label("latest_timestamp"),
-        )
-        .join(
-            models.Document,
-            models.Document.id == models.LogEntry.document_id,
-        )
-        .filter(models.Document.type == models.DocumentType.LOG)
-        .group_by(
-            models.LogEntry.message,
-            models.LogEntry.level,
-            models.Document.id,
-            models.Document.title,
-        )
-        .all()
-    )
-
-    level_weights = {
-        "FATAL": 4,
-        "CRITICAL": 4,
-        "ERROR": 3,
-        "ERR": 3,
-        "WARN": 2,
-        "WARNING": 2,
-        "INFO": 0,
-        "DEBUG": 0,
-    }
-
-    scored_patterns = []
-
-    for row in rows:
-        message = row.message or ""
-        message_terms = set(re.findall(r"[a-zA-Z0-9_-]+", message.lower()))
-        matching_terms = search_terms.intersection(message_terms)
-
-        if not matching_terms:
-            continue
-
-        level = (row.level or "UNKNOWN").upper()
-        score = (
-            len(matching_terms) * 3
-            + level_weights.get(level, 1)
-            + min(int(row.occurrence_count or 0), 10) * 0.1
-        )
-
-        scored_patterns.append(
-            {
-                "score": round(score, 2),
-                "message": message,
-                "level": level,
-                "occurrence_count": int(row.occurrence_count or 0),
-                "document_id": row.document_id,
-                "document_title": row.document_title,
-                "latest_timestamp": (
-                    row.latest_timestamp.isoformat()
-                    if row.latest_timestamp
-                    else None
-                ),
-                "matching_terms": sorted(matching_terms),
-            }
-        )
-
-    scored_patterns.sort(key=lambda item: item["score"], reverse=True)
-    return scored_patterns[:top_k]
-
-
 def build_log_context(log_patterns: list[dict]) -> str:
     """Format related historical log patterns for the LLM prompt."""
     if not log_patterns:
@@ -968,7 +888,282 @@ def build_log_context(log_patterns: list[dict]) -> str:
 
     return "\n\n".join(sections)
 
+# SECTION: Log ingestion (uploaded files -> structured log_entries)
+LOG_EXTENSIONS = (".log", ".txt", ".json", ".jsonl", ".ndjson")
+
+
+async def _read_upload_limited(file: UploadFile) -> bytes:
+    """Read an upload into memory, refusing anything over MAX_UPLOAD_MB."""
+    limit = settings.MAX_UPLOAD_MB * 1024 * 1024
+    buffer = bytearray()
+    while chunk := await file.read(1024 * 1024):
+        buffer.extend(chunk)
+        if len(buffer) > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum is {settings.MAX_UPLOAD_MB} MB.",
+            )
+    return bytes(buffer)
+
+
+def _ingest_logs(
+    db: Session,
+    data: bytes,
+    title: str,
+    uploader: models.User,
+    workspace_id: Optional[int],
+    incident: Optional[models.Incident],
+    default_service: Optional[str],
+) -> dict:
+    """
+    Parse uploaded log bytes into LogEntry rows.
+
+    The raw file is NOT kept on disk (hosted disks are ephemeral and storage is
+    tight); the parsed rows are the source of truth. Enforces the free-tier
+    budget: upload size, line count, per-workspace row cap and total DB size.
+    """
+    if b"\x00" in data[:8192]:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="This looks like a binary file, not a text log.",
+        )
+
+    digest = hashlib.sha256(data).hexdigest()
+    ws_filter = (
+        models.Document.workspace_id.is_(None)
+        if workspace_id is None
+        else models.Document.workspace_id == workspace_id
+    )
+    duplicate = (
+        db.query(models.Document)
+        .filter(models.Document.type == models.DocumentType.LOG,
+                models.Document.sha256 == digest, ws_filter)
+        .first()
+    )
+    if duplicate:
+        return {
+            "id": duplicate.id, "title": duplicate.title, "type": duplicate.type,
+            "status": duplicate.status, "duplicate": True, "log_entries_created": 0,
+            "message": "This exact file was already uploaded.",
+        }
+
+    size_mb = database_size_mb()
+    if size_mb is not None and size_mb >= settings.DB_STORAGE_LIMIT_MB:
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail="Storage limit reached. Ask an admin to purge old logs.",
+        )
+
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if text.lstrip().startswith("["):  # a JSON array of log objects
+        try:
+            parsed_array = json.loads(text)
+            if isinstance(parsed_array, list):
+                lines = [json.dumps(o) for o in parsed_array if isinstance(o, dict)]
+        except ValueError:
+            pass
+
+    if len(lines) > settings.MAX_LINES_PER_UPLOAD:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many lines ({len(lines)}). Maximum per upload is {settings.MAX_LINES_PER_UPLOAD}.",
+        )
+    if workspace_id is not None:
+        existing_rows = (
+            db.query(func.count(models.LogEntry.id))
+            .filter(models.LogEntry.workspace_id == workspace_id)
+            .scalar()
+            or 0
+        )
+        if existing_rows + len(lines) > settings.MAX_LOG_ENTRIES_PER_WORKSPACE:
+            raise HTTPException(
+                status_code=413,
+                detail="Workspace log quota exceeded. Old logs are purged automatically after "
+                       f"{settings.LOG_RETENTION_DAYS} days.",
+            )
+
+    document = models.Document(
+        title=title,
+        file_path="(not retained)",
+        type=models.DocumentType.LOG,
+        status="processing",
+        uploader_id=uploader.id,
+        workspace_id=workspace_id,
+        incident_id=incident.id if incident else None,
+        size_bytes=len(data),
+        sha256=digest,
+    )
+    db.add(document)
+    db.flush()
+
+    created = with_timestamp = 0
+    services: dict[str, int] = {}
+    batch: list[dict] = []
+    try:
+        for parsed in log_parsing.parse_log_lines(lines, default_service):
+            raw = parsed["raw"]
+            # Keep the raw line only where it adds information (JSON / unparsed).
+            keep_raw = parsed["timestamp"] is None or raw.startswith("{")
+            batch.append(
+                {
+                    "document_id": document.id,
+                    "incident_id": incident.id if incident else None,
+                    "workspace_id": workspace_id,
+                    "timestamp": parsed["timestamp"],
+                    "level": parsed["level"],
+                    "message": parsed["message"],
+                    "raw": raw[:2000] if keep_raw else None,
+                    "service": parsed["service"],
+                    "trace_id": parsed["trace_id"],
+                    "host": parsed["host"],
+                    "attributes": parsed["attributes"],
+                }
+            )
+            created += 1
+            with_timestamp += 1 if parsed["timestamp"] else 0
+            if parsed["service"]:
+                services[parsed["service"]] = services.get(parsed["service"], 0) + 1
+            if len(batch) >= 1000:
+                db.execute(insert(models.LogEntry), batch)
+                batch = []
+        if batch:
+            db.execute(insert(models.LogEntry), batch)
+        if created == 0:
+            raise ValueError("no log lines found")
+        document.status = "processed"
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        print(f"[ingest] failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=422,
+            detail="Could not parse any log lines from this file.",
+        )
+
+    return {
+        "id": document.id,
+        "title": document.title,
+        "type": document.type,
+        "status": document.status,
+        "duplicate": False,
+        "log_entries_created": created,
+        "entries_with_timestamp": with_timestamp,
+        "services_detected": sorted(services, key=services.get, reverse=True)[:20],
+    }
+
+
+@app.post("/incidents/{incident_id}/logs", status_code=status.HTTP_201_CREATED)
+async def upload_incident_logs(
+    incident_id: int,
+    file: Annotated[UploadFile, File(...)],
+    db: DbSessionDep,
+    current_user: Annotated[models.User, Depends(get_current_user)],
+    title: Annotated[Optional[str], Form()] = None,
+    service: Annotated[Optional[str], Form()] = None,
+):
+    """
+    Upload a log file (.log, .txt, .json, .jsonl, .ndjson) for an incident.
+
+    Any signed-in user may upload to incidents in their own workspace. The
+    client's filename is only used as a display title; it never touches the
+    filesystem.
+    """
+    incident = get_incident_for_user(db, incident_id, current_user)
+    limiter.check(f"upload:{current_user.id}", limit=20, window_seconds=3600)
+
+    filename = os.path.basename(file.filename or "")
+    if not filename or not filename.lower().endswith(LOG_EXTENSIONS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file type. Upload .log, .txt, .json, .jsonl or .ndjson.",
+        )
+
+    data = await _read_upload_limited(file)
+    result = await asyncio.to_thread(
+        _ingest_logs,
+        db,
+        data,
+        (title or filename)[:200],
+        current_user,
+        incident.workspace_id,
+        incident,
+        (service or incident.service or "").strip() or None,
+    )
+    return result
+
+
+@app.get("/incidents/{incident_id}/logs")
+async def match_incident_logs(
+    incident_id: int,
+    db: DbSessionDep,
+    current_user: Annotated[models.User, Depends(get_current_user)],
+    before_minutes: Optional[int] = None,
+    after_minutes: Optional[int] = None,
+    service: Optional[str] = None,
+    limit: int = 20,
+):
+    """
+    Rank log clusters that may be connected to this incident, with reasons.
+
+    Deterministic: time window around the incident start, service match, term
+    overlap with the incident text, level and frequency. No LLM involved.
+    """
+    incident = get_incident_for_user(db, incident_id, current_user)
+    services = [s.strip() for s in (service or "").split(",") if s.strip()] or (
+        [incident.service] if incident.service else []
+    )
+    result = await asyncio.to_thread(
+        log_matching.match_logs,
+        DatabaseLogSource(db),
+        workspace_id=incident.workspace_id,
+        title=incident.title,
+        description=incident.description,
+        services=services,
+        anchor=incident.started_at,
+        resolved_at=incident.resolved_at,
+        before_minutes=settings.LOG_WINDOW_BEFORE_MINUTES if before_minutes is None else max(0, min(before_minutes, 1440)),
+        after_minutes=settings.LOG_WINDOW_AFTER_MINUTES if after_minutes is None else max(0, min(after_minutes, 1440)),
+        max_rows=settings.MATCH_MAX_ROWS,
+        top_n=max(1, min(limit, 50)),
+    )
+    return {"incident_id": incident.id, **result}
+
+
+@app.get("/incidents/{incident_id}/logs/clusters/{cluster_id}/entries")
+async def cluster_log_entries(
+    incident_id: int,
+    cluster_id: str,
+    db: DbSessionDep,
+    current_user: Annotated[models.User, Depends(get_current_user)],
+    before_minutes: Optional[int] = None,
+    after_minutes: Optional[int] = None,
+    service: Optional[str] = None,
+):
+    """All raw lines in one matched cluster (the drill-down view)."""
+    incident = get_incident_for_user(db, incident_id, current_user)
+    services = [s.strip() for s in (service or "").split(",") if s.strip()] or (
+        [incident.service] if incident.service else []
+    )
+    entries = await asyncio.to_thread(
+        log_matching.cluster_entries,
+        DatabaseLogSource(db),
+        cluster_id,
+        workspace_id=incident.workspace_id,
+        title=incident.title,
+        description=incident.description,
+        services=services,
+        anchor=incident.started_at,
+        resolved_at=incident.resolved_at,
+        before_minutes=settings.LOG_WINDOW_BEFORE_MINUTES if before_minutes is None else max(0, min(before_minutes, 1440)),
+        after_minutes=settings.LOG_WINDOW_AFTER_MINUTES if after_minutes is None else max(0, min(after_minutes, 1440)),
+        max_rows=settings.MATCH_MAX_ROWS,
+    )
+    return {"incident_id": incident.id, "cluster_id": cluster_id, "count": len(entries), "entries": entries}
+
+
 @app.post("/admin/upload", status_code=status.HTTP_201_CREATED)
+@app.post("/documents/upload", status_code=status.HTTP_201_CREATED)
 async def upload_document(
     title: Annotated[str, Form(...)] ,
     file: Annotated[UploadFile, File(...)] ,
@@ -976,10 +1171,11 @@ async def upload_document(
     current_admin: Annotated[models.User, Depends(get_current_admin)],
     ):
     """
-    Admin endpoint to upload a file.
+    Admin endpoint to upload a shared file.
 
-    - For log files (.log/.jsonl/.ndjson): parses lines into LogEntry records.
-    - For runbooks/docs (pdf/txt/md): parses text, chunks it, and generates embeddings for each chunk.
+    - Log files (.log/.jsonl/.ndjson): parsed into shared LogEntry records.
+    - Runbooks/docs (pdf/txt/md): parsed, chunked and embedded.
+    Regular users upload logs per incident via POST /incidents/{id}/logs.
     """
 
     if not file.filename:
@@ -995,6 +1191,12 @@ async def upload_document(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Unsupported file type. Please upload .log, .jsonl, .ndjson, .pdf, .txt, or .md files.",
+        )
+
+    if doc_type == models.DocumentType.LOG:
+        data = await _read_upload_limited(file)
+        return await asyncio.to_thread(
+            _ingest_logs, db, data, title[:200], current_admin, None, None, None
         )
 
     # Generating safe unique filename
@@ -1026,54 +1228,8 @@ async def upload_document(
     db.commit()
     db.refresh(document)
 
-    # --- Document Type Specific Processing ---
-
-    # If it's a log file, parse into LogEntry
-    if doc_type == models.DocumentType.LOG:
-        created_count = 0
-
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    parsed = parse_log_line(line)
-                    if not parsed:
-                        continue
-
-                    log_entry = models.LogEntry(
-                        document_id=document.id,
-                        incident_id=None,  # Later we may link to an Incident
-                        timestamp=parsed["timestamp"],
-                        level=parsed["level"],
-                        message=parsed["message"],
-                        raw=parsed["raw"],
-                    )
-                    db.add(log_entry)
-                    created_count += 1
-
-            document.status = "processed"
-            db.add(document)
-            db.commit()
-            db.refresh(document)
-
-        except Exception as e:
-            document.status = "failed"
-            db.add(document)
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to parse log file: {e}",
-            )
-
-        return {
-            "id": document.id,
-            "title": document.title,
-            "type": document.type,
-            "status": document.status,
-            "log_entries_created": created_count,
-        }
-
     # If it's a runbook/doc, parse text, chunk, and embed
-    elif doc_type == models.DocumentType.RUNBOOK:
+    if doc_type == models.DocumentType.RUNBOOK:
         full_text = ""
         try:
             # Check file extension before trying pypdf
@@ -1108,7 +1264,7 @@ async def upload_document(
             db.commit()
             os.remove(file_path)
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail="Document contains no extractable text content.",
             )
 
@@ -1152,7 +1308,11 @@ async def upload_document(
 
 
 @app.get("/logs/{document_id}/summary", response_model=dict)
-def get_log_summary(document_id: int, db: DbSessionDep):
+def get_log_summary(
+    document_id: int,
+    db: DbSessionDep,
+    current_user: Annotated[models.User, Depends(get_current_user)],
+):
     """
     Retrieves a summary of log entries for a given document.
 
@@ -1163,7 +1323,7 @@ def get_log_summary(document_id: int, db: DbSessionDep):
     - Time range of logs
     """
     # Verifying document exists and is a log file
-    document = db.query(models.Document).filter(models.Document.id == document_id).first()
+    document = visible_documents(db, current_user).filter(models.Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
     if document.type != models.DocumentType.LOG:
@@ -1266,9 +1426,8 @@ async def ask_incident_assistant(
     Flow: retrieve -> build a numbered context block -> call the configured LLM
     -> persist the question and answer for analytics.
     """
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
-    if not incident:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found.")
+    incident = get_incident_for_user(db, incident_id, current_user)
+    limiter.check(f"ask:{current_user.id}", limit=30, window_seconds=3600)
 
     question = question.strip()
     if not question:
@@ -1285,14 +1444,23 @@ async def ask_incident_assistant(
         retrieve_relevant_chunks, db, question, top_k
     )
 
-    # Searching previously uploaded logs for related historical patterns.
-    relevant_log_patterns = await asyncio.to_thread(
-        retrieve_relevant_log_patterns,
-        db,
-        question,
-        incident,
-        5,
+    # Matching uploaded logs to this incident (deterministic, see log_matching.py).
+    log_match = await asyncio.to_thread(
+        log_matching.match_logs,
+        DatabaseLogSource(db),
+        workspace_id=incident.workspace_id,
+        title=incident.title,
+        description=incident.description,
+        services=[incident.service] if incident.service else [],
+        anchor=incident.started_at,
+        resolved_at=incident.resolved_at,
+        extra_text=question,
+        before_minutes=settings.LOG_WINDOW_BEFORE_MINUTES,
+        after_minutes=settings.LOG_WINDOW_AFTER_MINUTES,
+        max_rows=settings.MATCH_MAX_ROWS,
+        top_n=5,
     )
+    relevant_log_patterns = log_match["clusters"]
     log_context = build_log_context(relevant_log_patterns)
 
     if relevant_chunks:
@@ -1394,6 +1562,13 @@ def submit_answer_feedback(
         models.QuestionLog.id == feedback_data.question_log_id
     ).first()
 
+    if question_log_entry is not None and not current_user.is_admin:
+        owner_incident = db.query(models.Incident).filter(
+            models.Incident.id == question_log_entry.incident_id
+        ).first()
+        if owner_incident is None or owner_incident.workspace_id != current_user.default_workspace_id:
+            question_log_entry = None
+
     if not question_log_entry:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1434,21 +1609,43 @@ def analytics_summary(
     The feedback loop only has value if you can see it, so this surfaces the
     helpful/unhelpful split alongside volume.
     """
-    total_questions = db.query(func.count(models.QuestionLog.id)).scalar() or 0
-    total_feedback = db.query(func.count(models.AnswerFeedback.id)).scalar() or 0
+    ws = current_user.default_workspace_id
+    is_admin = bool(current_user.is_admin)
+
+    def in_workspace(query, model):
+        """Non-admins only see activity on incidents in their own workspace."""
+        if is_admin:
+            return query
+        return query.join(models.Incident, models.Incident.id == model.incident_id).filter(
+            models.Incident.workspace_id == ws
+        )
+
+    total_questions = in_workspace(
+        db.query(func.count(models.QuestionLog.id)), models.QuestionLog
+    ).scalar() or 0
+    total_feedback = in_workspace(
+        db.query(func.count(models.AnswerFeedback.id)), models.AnswerFeedback
+    ).scalar() or 0
     helpful = (
-        db.query(func.count(models.AnswerFeedback.id))
+        in_workspace(db.query(func.count(models.AnswerFeedback.id)), models.AnswerFeedback)
         .filter(models.AnswerFeedback.is_helpful.is_(True))
         .scalar()
         or 0
     )
 
     recent = (
-        db.query(models.QuestionLog)
+        in_workspace(db.query(models.QuestionLog), models.QuestionLog)
         .order_by(models.QuestionLog.answered_at.desc())
         .limit(10)
         .all()
     )
+
+    visible_doc_ids = visible_documents(db, current_user).with_entities(models.Document.id)
+    log_entry_query = db.query(func.count(models.LogEntry.id))
+    if not is_admin:
+        log_entry_query = log_entry_query.filter(
+            or_(models.LogEntry.workspace_id == ws, models.LogEntry.workspace_id.is_(None))
+        )
 
     return {
         "total_questions": total_questions,
@@ -1457,17 +1654,18 @@ def analytics_summary(
         "unhelpful_count": total_feedback - helpful,
         "helpful_rate": round(helpful / total_feedback, 3) if total_feedback else None,
         "documents": {
-            "runbooks": db.query(func.count(models.Document.id))
+            "runbooks": visible_documents(db, current_user)
             .filter(models.Document.type == models.DocumentType.RUNBOOK)
-            .scalar()
-            or 0,
-            "logs": db.query(func.count(models.Document.id))
+            .count(),
+            "logs": visible_documents(db, current_user)
             .filter(models.Document.type == models.DocumentType.LOG)
-            .scalar()
-            or 0,
+            .count(),
         },
-        "total_chunks": db.query(func.count(models.DocumentChunk.id)).scalar() or 0,
-        "total_log_entries": db.query(func.count(models.LogEntry.id)).scalar() or 0,
+        "total_chunks": db.query(func.count(models.DocumentChunk.id))
+        .filter(models.DocumentChunk.document_id.in_(visible_doc_ids))
+        .scalar()
+        or 0,
+        "total_log_entries": log_entry_query.scalar() or 0,
         "recent_questions": [
             {
                 "id": q.id,
@@ -1478,6 +1676,33 @@ def analytics_summary(
             for q in recent
         ],
     }
+
+
+# SECTION: Admin: storage budget and retention
+@app.get("/admin/storage")
+def storage_status(
+    db: DbSessionDep,
+    current_admin: Annotated[models.User, Depends(get_current_admin)],
+):
+    """Where we are against the free-tier budget. Admin only."""
+    size_mb = database_size_mb()
+    return {
+        "database_size_mb": size_mb,
+        "database_limit_mb": settings.DB_STORAGE_LIMIT_MB,
+        "used_fraction": round(size_mb / settings.DB_STORAGE_LIMIT_MB, 3) if size_mb is not None else None,
+        "log_entries": db.query(func.count(models.LogEntry.id)).scalar() or 0,
+        "max_log_entries_per_workspace": settings.MAX_LOG_ENTRIES_PER_WORKSPACE,
+        "max_upload_mb": settings.MAX_UPLOAD_MB,
+        "retention_days": settings.LOG_RETENTION_DAYS,
+    }
+
+
+@app.post("/admin/maintenance/purge")
+async def purge_logs_now(
+    current_admin: Annotated[models.User, Depends(get_current_admin)],
+):
+    """Run the retention purge immediately instead of waiting for the timer."""
+    return await asyncio.to_thread(retention.purge_old_logs)
 
 
 # SECTION: Front end
