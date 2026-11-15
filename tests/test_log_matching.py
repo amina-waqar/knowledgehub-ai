@@ -109,3 +109,30 @@ def test_sample_incident_ranks_root_cause_logs_above_noise():
     assert ranks["payments-svc"] < ranks["email-worker"]
     assert ranks["payments-svc"] < ranks["search-svc"]
     assert result["timeline"] and sum(b["count"] for b in result["timeline"]) > 0
+
+
+def test_service_name_is_not_a_keyword_hit_and_info_from_service_is_not_evidence():
+    records = [
+        rec(1, 1, "INFO", "Order 1018 created in 86ms", "checkout-api"),
+        rec(2, 1, "ERROR", "Database timeout after 5000ms waiting for connection", "payments-svc"),
+    ]
+    out = rank_clusters(records, ["checkout", "timeout"], ["checkout-api"], anchor=T0, windowed=True)
+    # "checkout" appears only in the service name, so the routine INFO line is excluded...
+    assert [c["service"] for c in out] == ["payments-svc"]
+    # ...and a WARN+ line from the incident's service still earns the service bonus.
+    warn = rec(3, 1, "WARN", "Retrying request", "checkout-api")
+    out = rank_clusters([warn], ["timeout"], ["checkout-api"], anchor=T0, windowed=True)
+    assert out[0]["score_breakdown"]["service"] > 0
+
+
+def test_sample_incident_info_noise_never_outranks_errors():
+    result = match_logs(
+        ListSource(load_sample()), workspace_id=1,
+        title="Checkout failing: payment timeouts", description=None,
+        services=["checkout-api"], anchor=T0, resolved_at=None,
+    )
+    levels = [c["level"] for c in result["clusters"]]
+    first_info = next((i for i, lv in enumerate(levels) if lv == "INFO"), len(levels))
+    assert all(lv != "INFO" for lv in levels[:first_info])
+    notable_ranks = [i for i, c in enumerate(result["clusters"]) if c["level"] in ("ERROR", "CRITICAL", "FATAL")]
+    assert max(notable_ranks) < first_info or first_info == len(levels)

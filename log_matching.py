@@ -200,19 +200,21 @@ def rank_clusters(
 
     ranked: list[dict] = []
     for (template, level, service_key), members in groups.items():
+        # Terms are matched against the message text only. The service name is
+        # scored separately; counting it here too would double-reward every
+        # line from the incident's service.
         message_tokens: set[str] = set()
         for member in members[:20]:  # a cluster's lines are near-identical
             message_tokens |= tokens(member.message)
-        if service_key:
-            message_tokens |= tokens(service_key)
         matching_terms = sorted(term_set & message_tokens)
 
         level_weight = LEVEL_WEIGHTS.get(level or "", UNKNOWN_LEVEL_WEIGHT)
-        service_match = bool(service_key and service_key in service_set)
+        notable = level_weight >= NOTABLE_LEVEL_WEIGHT
+        # Running on the incident's service only counts for WARN and worse:
+        # routine INFO lines from that service are not evidence of anything.
+        service_match = bool(service_key and service_key in service_set) and notable
 
-        included = bool(matching_terms) or service_match or (
-            windowed and level_weight >= NOTABLE_LEVEL_WEIGHT
-        )
+        included = bool(matching_terms) or service_match or (windowed and notable)
         if not included:
             continue
 
