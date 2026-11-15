@@ -14,6 +14,16 @@ The demo environment contains sample data and is intended for portfolio and recr
 **Note:** The demo is hosted on Render's free tier, so the first load may take up to a minute if the service has been inactive.
 ---
 
+## Incident-to-Log Matching
+
+Create or open an incident, upload log files (JSON, JSONL or plain text), and LogLens ranks the log events most likely connected to it. Matching is deterministic: a time window around the incident start, the affected service, keyword overlap with the incident text, log severity, closeness to the start time and repetition. Each result shows its score breakdown and the reasons it matched, with the raw lines one click away. Log sources sit behind a small interface, so integrations such as Loki, CloudWatch or Datadog can be added later.
+
+Data is isolated per workspace, uploaded files are parsed and not retained, and storage is capped for free-tier hosting. See `docs/NEON.md` for the Neon PostgreSQL setup, and `sample_data/README.md` for a sample incident. Public signup is disabled by default (`SIGNUP_ENABLED=false`).
+
+Run the tests with `pip install -r requirements-dev.txt && pytest`.
+
+---
+
 ## Application Preview
 
 ![LogLens AI Login](docs/images/loglens-login.png)

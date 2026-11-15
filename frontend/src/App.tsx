@@ -3,6 +3,7 @@ import './App.css'
 
 import IncidentCard from './components/IncidentCard'
 import LoginForm from './components/LoginForm'
+import EvidencePanel from './components/EvidencePanel'
 
 import type { Incident, IncidentListResponse } from './types/Incident'
 import type { Document, DocumentListResponse } from './types/Document'
@@ -29,6 +30,8 @@ function App() {
   const [newIncidentTitle, setNewIncidentTitle] = useState('')
   const [newIncidentDescription, setNewIncidentDescription] = useState('')
   const [newIncidentSeverity, setNewIncidentSeverity] = useState('medium')
+  const [newIncidentService, setNewIncidentService] = useState('')
+  const [newIncidentStartedAt, setNewIncidentStartedAt] = useState('')
   const [creatingIncident, setCreatingIncident] = useState(false)
   const [createIncidentError, setCreateIncidentError] = useState('')
   const [isLoadingIncidents, setIsLoadingIncidents] = useState(false)
@@ -157,6 +160,10 @@ function App() {
         description: newIncidentDescription.trim(),
         severity: newIncidentSeverity,
         status: 'open',
+        service: newIncidentService.trim() || null,
+        started_at: newIncidentStartedAt
+          ? new Date(newIncidentStartedAt).toISOString()
+          : null,
       }),
     })
 
@@ -170,6 +177,8 @@ function App() {
     setNewIncidentTitle('')
     setNewIncidentDescription('')
     setNewIncidentSeverity('medium')
+    setNewIncidentService('')
+    setNewIncidentStartedAt('')
 
     selectIncident(newIncident.id)
   } catch (error) {
@@ -630,6 +639,22 @@ function App() {
                     </p>
                   )}
 
+                  {selectedIncident.service && (
+                    <p>
+                      <strong>Service:</strong>{' '}
+                      {selectedIncident.service}
+                    </p>
+                  )}
+
+                  {selectedIncident.started_at && (
+                    <p>
+                      <strong>Started:</strong>{' '}
+                      {new Date(
+                        selectedIncident.started_at
+                      ).toLocaleString()}
+                    </p>
+                  )}
+
                   <p>
                     <strong>Created:</strong>{' '}
                     {new Date(
@@ -637,6 +662,15 @@ function App() {
                     ).toLocaleString()}
                   </p>
                 </div>
+
+                {token && (
+                  <EvidencePanel
+                    key={selectedIncident.id}
+                    apiUrl={API_URL}
+                    token={token}
+                    incident={selectedIncident}
+                  />
+                )}
 
                 <section className="investigation-section">
                   <h2>AI Investigation</h2>
@@ -815,6 +849,29 @@ function App() {
                       <option value="high">High</option>
                       <option value="critical">Critical</option>
                     </select>
+                  </div>
+                </div>
+
+                <div className="incident-form-row">
+                  <div className="incident-form-field">
+                    <label htmlFor="incident-service">Affected service (optional)</label>
+                    <input
+                      id="incident-service"
+                      type="text"
+                      placeholder="e.g. checkout-api"
+                      value={newIncidentService}
+                      onChange={(e) => setNewIncidentService(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="incident-form-field">
+                    <label htmlFor="incident-started">Started at (defaults to now)</label>
+                    <input
+                      id="incident-started"
+                      type="datetime-local"
+                      value={newIncidentStartedAt}
+                      onChange={(e) => setNewIncidentStartedAt(e.target.value)}
+                    />
                   </div>
                 </div>
 
