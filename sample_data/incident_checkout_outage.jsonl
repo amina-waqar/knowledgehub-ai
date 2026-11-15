@@ -1,0 +1,51 @@
+{"timestamp": "2026-01-15T14:00:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1000 created in 100ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:00:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1000", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:02:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1002 created in 140ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:02:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1002", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:04:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1004 created in 89ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:04:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1004", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:06:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1006 created in 105ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:06:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1006", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:08:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1008 created in 121ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:08:00Z", "level": "INFO", "service": "redis-cache", "message": "Cache hit ratio 0.93", "host": "cache-1"}
+{"timestamp": "2026-01-15T14:08:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1008", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:10:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1010 created in 83ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:10:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1010", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:12:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1012 created in 84ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:12:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1012", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:14:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1014 created in 132ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:14:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1014", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:16:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1016 created in 114ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:16:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1016", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:18:00Z", "level": "INFO", "service": "checkout-api", "message": "Order 1018 created in 86ms", "host": "web-1"}
+{"timestamp": "2026-01-15T14:18:30Z", "level": "INFO", "service": "payments-svc", "message": "Charge approved for order 1018", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:19:30Z", "level": "WARN", "service": "postgres-primary", "message": "Connection count 92 of 100 max_connections", "host": "db-1"}
+{"timestamp": "2026-01-15T14:20:00Z", "level": "WARN", "service": "payments-svc", "message": "Connection pool at 95% utilisation (pool=db-main)", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:20:24Z", "level": "ERROR", "service": "payments-svc", "message": "Database timeout after 5000ms waiting for connection from pool db-main", "trace_id": "trace-9000", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:20:30Z", "level": "ERROR", "service": "checkout-api", "message": "Payment request failed: upstream payments-svc returned 503 for order 2000", "trace_id": "trace-9000", "host": "web-1"}
+{"timestamp": "2026-01-15T14:20:54Z", "level": "ERROR", "service": "payments-svc", "message": "Database timeout after 5000ms waiting for connection from pool db-main", "trace_id": "trace-9001", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:21:00Z", "level": "ERROR", "service": "checkout-api", "message": "Payment request failed: upstream payments-svc returned 503 for order 2001", "trace_id": "trace-9001", "host": "web-1"}
+{"timestamp": "2026-01-15T14:21:00Z", "level": "ERROR", "service": "search-svc", "message": "Index shard 4 rebalancing, queries slower than 2s", "host": "search-1"}
+{"timestamp": "2026-01-15T14:21:12Z", "level": "WARN", "service": "email-worker", "message": "SMTP relay retry 1 of 5", "host": "mail-1"}
+{"timestamp": "2026-01-15T14:21:18Z", "level": "ERROR", "service": "payments-svc", "message": "Database timeout after 5000ms waiting for connection from pool db-main", "trace_id": "trace-9002", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:21:24Z", "level": "ERROR", "service": "checkout-api", "message": "Payment request failed: upstream payments-svc returned 503 for order 2002", "trace_id": "trace-9002", "host": "web-1"}
+{"timestamp": "2026-01-15T14:21:48Z", "level": "ERROR", "service": "payments-svc", "message": "Database timeout after 5000ms waiting for connection from pool db-main", "trace_id": "trace-9003", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:21:54Z", "level": "ERROR", "service": "checkout-api", "message": "Payment request failed: upstream payments-svc returned 503 for order 2003", "trace_id": "trace-9003", "host": "web-1"}
+{"timestamp": "2026-01-15T14:22:00Z", "level": "ERROR", "service": "postgres-primary", "message": "FATAL: remaining connection slots are reserved for non-replication superuser connections", "host": "db-1"}
+{"timestamp": "2026-01-15T14:22:12Z", "level": "ERROR", "service": "payments-svc", "message": "Database timeout after 5000ms waiting for connection from pool db-main", "trace_id": "trace-9004", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:22:18Z", "level": "ERROR", "service": "checkout-api", "message": "Payment request failed: upstream payments-svc returned 503 for order 2004", "trace_id": "trace-9004", "host": "web-1"}
+{"timestamp": "2026-01-15T14:22:30Z", "level": "ERROR", "service": "postgres-primary", "message": "FATAL: remaining connection slots are reserved for non-replication superuser connections", "host": "db-1"}
+{"timestamp": "2026-01-15T14:22:42Z", "level": "ERROR", "service": "payments-svc", "message": "Database timeout after 5000ms waiting for connection from pool db-main", "trace_id": "trace-9005", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:22:48Z", "level": "ERROR", "service": "checkout-api", "message": "Payment request failed: upstream payments-svc returned 503 for order 2005", "trace_id": "trace-9005", "host": "web-1"}
+{"timestamp": "2026-01-15T14:23:00Z", "level": "WARN", "service": "checkout-api", "message": "Retrying payment request (attempt 2 of 3)", "host": "web-1"}
+{"timestamp": "2026-01-15T14:23:00Z", "level": "ERROR", "service": "search-svc", "message": "Index shard 4 rebalancing, queries slower than 2s", "host": "search-1"}
+{"timestamp": "2026-01-15T14:23:06Z", "level": "ERROR", "service": "payments-svc", "message": "Database timeout after 5000ms waiting for connection from pool db-main", "trace_id": "trace-9006", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:23:12Z", "level": "ERROR", "service": "checkout-api", "message": "Payment request failed: upstream payments-svc returned 503 for order 2006", "trace_id": "trace-9006", "host": "web-1"}
+{"timestamp": "2026-01-15T14:23:12Z", "level": "WARN", "service": "email-worker", "message": "SMTP relay retry 1 of 5", "host": "mail-1"}
+{"timestamp": "2026-01-15T14:24:00Z", "level": "WARN", "service": "redis-cache", "message": "Slow response from Redis: 480ms", "host": "cache-1"}
+{"timestamp": "2026-01-15T14:25:00Z", "level": "CRITICAL", "service": "checkout-api", "message": "Circuit breaker OPEN for payments-svc", "host": "web-1"}
+{"timestamp": "2026-01-15T14:26:00Z", "level": "ERROR", "service": "search-svc", "message": "Index shard 4 rebalancing, queries slower than 2s", "host": "search-1"}
+{"timestamp": "2026-01-15T14:26:12Z", "level": "WARN", "service": "email-worker", "message": "SMTP relay retry 1 of 5", "host": "mail-1"}
+{"timestamp": "2026-01-15T14:31:00Z", "level": "INFO", "service": "payments-svc", "message": "Connection pool restarted with size 40 (was 20)", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:32:00Z", "level": "INFO", "service": "payments-svc", "message": "Connection pool at 22% utilisation (pool=db-main)", "host": "pay-1"}
+{"timestamp": "2026-01-15T14:33:00Z", "level": "INFO", "service": "checkout-api", "message": "Circuit breaker CLOSED for payments-svc", "host": "web-1"}
