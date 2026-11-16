@@ -28,7 +28,7 @@ defends against hitting it:
 | `MAX_UPLOAD_MB` | 5 | Per-file cap. |
 | `MAX_LINES_PER_UPLOAD` | 50000 | Per-file line cap. |
 | `MAX_LOG_ENTRIES_PER_WORKSPACE` | 100000 | One workspace cannot use the whole budget. |
-| `LOG_RETENTION_DAYS` | 14 | Log rows older than this (by upload time) are deleted every 6 hours. `0` disables. |
+| `LOG_RETENTION_DAYS` | 14 | Workspace log rows older than this (by upload time) are deleted every 6 hours. Shared admin-uploaded logs and logs from before workspaces existed are kept. `0` disables. |
 
 Raw files are not stored; only parsed rows are. Admins can check usage at
 `GET /admin/storage` and purge immediately with `POST /admin/maintenance/purge`.

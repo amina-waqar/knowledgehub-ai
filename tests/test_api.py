@@ -262,7 +262,27 @@ def test_retention_purges_old_rows_only(client):
     assert retention.purge_old_logs(retention_days=0)["enabled"] is False
 
 
+def test_retention_never_purges_shared_or_pre_workspace_logs(client):
+    """Shared logs (workspace_id NULL) include all data from before workspaces existed."""
+    import retention
+    make_user("admin", admin=True)
+    r = client.post("/admin/upload", headers=auth(client, "admin"), data={"title": "shared"},
+                    files={"file": ("shared.jsonl", io.BytesIO(SAMPLE.read_bytes()), "text/plain")})
+    assert r.status_code == 201, r.text
+    old = datetime.now(timezone.utc) - timedelta(days=400)
+    with SessionLocal() as db:
+        db.query(models.LogEntry).update({"created_at": old})
+        db.query(models.Document).update({"uploaded_at": old})
+        db.commit()
+    out = retention.purge_old_logs(retention_days=14)
+    assert out["entries_deleted"] == 0 and out["documents_deleted"] == 0
+    with SessionLocal() as db:
+        assert db.query(models.LogEntry).count() == 51
+        assert db.query(models.Document).count() == 1
+
+
 def test_admin_storage_endpoint(client):
     make_user("admin", admin=True)
     r = client.get("/admin/storage", headers=auth(client, "admin"))
     assert r.status_code == 200 and r.json()["retention_days"] == settings.LOG_RETENTION_DAYS
+
