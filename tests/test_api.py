@@ -286,3 +286,34 @@ def test_admin_storage_endpoint(client):
     r = client.get("/admin/storage", headers=auth(client, "admin"))
     assert r.status_code == 200 and r.json()["retention_days"] == settings.LOG_RETENTION_DAYS
 
+
+# ------------------------------------------------------------ input bounds
+def test_deeply_nested_json_upload_is_rejected_cleanly(client):
+    make_user("alice")
+    h = auth(client, "alice")
+    inc = create_incident(client, h)
+    assert upload(client, h, inc["id"], b"[" * 100_000, "deep.json").status_code in (201, 422)
+
+
+def test_incident_timestamps_are_utc_with_offset(client):
+    make_user("alice")
+    h = auth(client, "alice")
+    inc = create_incident(client, h, started_at="2026-01-15T06:20:00-08:00")
+    assert inc["started_at"] == "2026-01-15T14:20:00+00:00"
+    assert inc["created_at"].endswith("+00:00")
+
+
+def test_ask_and_search_bound_prompt_size(client, monkeypatch):
+    make_user("alice")
+    h = auth(client, "alice")
+    inc = create_incident(client, h)
+    too_long = "why " * 1000
+    assert client.post(f"/incidents/{inc['id']}/ask", headers=h, data={"question": too_long}).status_code == 400
+    seen = []
+    real = main.retrieve_relevant_chunks
+    monkeypatch.setattr(main, "retrieve_relevant_chunks",
+                        lambda db, q, top_k=None, threshold=None: seen.append(top_k) or real(db, q, top_k, threshold))
+    assert client.post(f"/incidents/{inc['id']}/ask?top_k_chunks=100000", headers=h, data={"question": "why?"}).status_code == 200
+    assert client.get("/search/runbooks?query=x&top_k=-5", headers=h).status_code == 200
+    assert client.get("/search/runbooks?query=x&top_k=100000", headers=h).status_code == 200
+    assert seen == [main.MAX_TOP_K, 1, main.MAX_TOP_K]

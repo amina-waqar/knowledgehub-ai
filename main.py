@@ -567,6 +567,16 @@ def get_incident(
     return _incident_to_dict(get_incident_for_user(db, incident_id, current_user))
 
 
+def _utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    """
+    ISO timestamp, always UTC with an explicit offset.
+
+    SQLite returns naive datetimes and Postgres returns them in the session
+    time zone; without this the browser reads a naive value as local time.
+    """
+    return log_matching.as_utc(dt).isoformat() if dt else None
+
+
 def _incident_to_dict(i: models.Incident) -> dict:
     return {
         "id": i.id,
@@ -574,11 +584,11 @@ def _incident_to_dict(i: models.Incident) -> dict:
         "description": i.description,
         "status": i.status,
         "severity": i.severity,
-        "created_at": i.created_at.isoformat() if i.created_at else None,
+        "created_at": _utc_iso(i.created_at),
         "creator_id": i.creator_id,
         "service": i.service,
-        "started_at": i.started_at.isoformat() if i.started_at else None,
-        "resolved_at": i.resolved_at.isoformat() if i.resolved_at else None,
+        "started_at": _utc_iso(i.started_at),
+        "resolved_at": _utc_iso(i.resolved_at),
         "source": i.source,
     }
 
@@ -961,7 +971,7 @@ def _ingest_logs(
             parsed_array = json.loads(text)
             if isinstance(parsed_array, list):
                 lines = [json.dumps(o) for o in parsed_array if isinstance(o, dict)]
-        except ValueError:
+        except (ValueError, RecursionError):  # not valid JSON, or nested too deeply
             pass
 
     if len(lines) > settings.MAX_LINES_PER_UPLOAD:
@@ -1397,6 +1407,7 @@ def search_runbooks(
     the RAG endpoint cannot drift apart. Default threshold is 0.0 here because
     when you are inspecting search quality you want to see the weak matches too.
     """
+    top_k = max(1, min(top_k, MAX_TOP_K))
     results = retrieve_relevant_chunks(db, query, top_k=top_k, threshold=threshold)
 
     return {
@@ -1412,6 +1423,11 @@ def search_runbooks(
 
 
 # SECTION: RAG Endpoint for Incident Investigation
+# Upper bounds on what a single request can put into an LLM prompt. The prompt
+# is what a paid provider bills for, so neither value is caller-controlled.
+MAX_QUESTION_CHARS = 2000
+MAX_TOP_K = 20
+
 @app.post("/incidents/{incident_id}/ask", response_model=dict)
 async def ask_incident_assistant(
     incident_id: int,
@@ -1436,7 +1452,13 @@ async def ask_incident_assistant(
             detail="Question cannot be empty.",
         )
 
-    top_k = top_k_chunks or settings.TOP_K_CHUNKS
+    if len(question) > MAX_QUESTION_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Question is too long. Maximum is {MAX_QUESTION_CHARS} characters.",
+        )
+
+    top_k = max(1, min(top_k_chunks or settings.TOP_K_CHUNKS, MAX_TOP_K))
 
     # Retrieval happens off the event loop: embedding a query is CPU-bound and
     # would otherwise block every other request on this worker.
