@@ -7,9 +7,8 @@
 | Role | Username | Password |
 |---|---|---|
 | Standard User | `loglens_test` | `TestPassword123!` |
-| Administrator | `admin` | `LogLensDemo123!` |
 
-The demo environment contains sample data and is intended for portfolio and recruiter testing. The administrator account demonstrates role-based access control and document-upload functionality.
+The demo environment contains sample data and is intended for portfolio and recruiter testing. The standard user account can browse incidents and ask questions; administrator access is not shared publicly.
 
 **Note:** The demo is hosted on Render's free tier, so the first load may take up to a minute if the service has been inactive.
 ---
@@ -298,10 +297,24 @@ VITE_API_URL=http://localhost:8000
 
 ### 6. Start the backend
 
-From the project root:
+From the project root, apply database migrations first. The app refuses to start
+against a database that is not up to date. Run this again whenever you pull new
+migrations:
 
 ```bash
+python migrate.py
 uvicorn main:app --reload --port 8000
+```
+
+An existing database created by an older version of LogLens is detected and
+adopted without changing its data. In Docker, `migrate.py` runs automatically
+before the server starts.
+
+### Running tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
 ```
 
 ### 7. Start the frontend

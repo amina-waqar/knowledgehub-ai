@@ -3,10 +3,13 @@
 Database engine and session management.
 """
 import time
+from typing import Annotated
+
+from fastapi import Depends
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy.orm import Session, sessionmaker, DeclarativeBase
 
 from config import settings
 
@@ -70,37 +73,6 @@ def wait_for_database(max_attempts: int = 30, delay_seconds: float = 1.0) -> Non
     raise RuntimeError(f"Database never became available: {last_error}")
 
 
-def ensure_pgvector_extension() -> None:
-    """
-    Create the pgvector extension if we are on Postgres and using it.
-
-    Must run before create_all(), because the vector column type does not exist
-    until the extension is installed.
-    """
-    if not settings.use_pgvector:
-        return
-
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    print("[db] pgvector extension is available.")
-
-
-def create_vector_index() -> None:
-    """
-    Add an approximate-nearest-neighbour index on the embedding column.
-
-    Without this, Postgres does an exact scan of every chunk. With it, retrieval
-    stays fast as the runbook corpus grows. HNSW gives better recall than
-    ivfflat and does not need a pre-populated table to build.
-    """
-    if not settings.use_pgvector:
-        return
-
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_hnsw "
-                "ON document_chunks USING hnsw (embedding vector_cosine_ops)"
-            )
-        )
-    print("[db] Vector index ready.")
+# Annotated[Session, Depends(get_database)] tells FastAPI:
+# "this parameter is a Session and should be provided by get_database."
+DbSessionDep = Annotated[Session, Depends(get_database)]

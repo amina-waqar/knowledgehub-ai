@@ -9,15 +9,23 @@ import os
 import uuid
 import re  # for log parsing
 
+from auth import (
+    create_access_token,
+    get_current_admin,
+    get_current_user,
+    get_password_hash,
+    get_user_by_username,
+    verify_password,
+)
 from database import (
+    DbSessionDep,
     engine,
-    Base,
-    get_database,
     SessionLocal,
     wait_for_database,
-    ensure_pgvector_extension,
-    create_vector_index,
 )
+from migrate import is_up_to_date
+from workspaces import MembershipDep, create_personal_workspace, require_role
+from workspaces import router as workspaces_router
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 import models
@@ -28,20 +36,12 @@ from sentence_transformers import SentenceTransformer
 import json
 import asyncio
 
-from passlib.context import CryptContext
-from jose import jwt, JWTError
 from datetime import timedelta, datetime, timezone
 
 from pydantic import BaseModel, EmailStr, Field
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from config import settings
 import llm
-
-# Auth config now comes from the environment. Nothing secret is in this file.
-SECRET_KEY = settings.SECRET_KEY
-ALGORITHM = settings.ALGORITHM
-ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 
 def bootstrap_admin() -> None:
@@ -73,6 +73,8 @@ def bootstrap_admin() -> None:
             is_admin=True,
         )
         db.add(admin)
+        db.flush()
+        create_personal_workspace(db, admin)
         db.commit()
         print(f"[bootstrap] Created admin user '{admin.username}'.")
     finally:
@@ -103,6 +105,8 @@ def bootstrap_demo_user() -> None:
         )
 
         db.add(demo_user)
+        db.flush()
+        create_personal_workspace(db, demo_user)
         db.commit()
         print(f"[bootstrap] Created demo user '{demo_user.username}'.")
     finally:
@@ -113,14 +117,11 @@ async def lifespan(app: FastAPI):
     Startup work, in the order it has to happen.
 
     In Docker the app container starts before Postgres is ready, so we wait.
-    pgvector has to be installed before create_all(), because the vector column
-    type does not exist until the extension does. The index comes after the
-    table exists.
+    Tables are created and upgraded by migrate.py, which runs before the app.
     """
     wait_for_database()
-    ensure_pgvector_extension()
-    Base.metadata.create_all(bind=engine)
-    create_vector_index()
+    if not is_up_to_date(engine):
+        raise RuntimeError("Database schema is out of date. Run: python migrate.py")
     bootstrap_admin()
     bootstrap_demo_user()
 
@@ -139,6 +140,7 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+app.include_router(workspaces_router)
 
 app.add_middleware( 
     CORSMiddleware,
@@ -161,9 +163,6 @@ if settings.cors_origin_list:
 UPLOAD_DIR = "uploaded_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-DbSessionDep = Annotated[Session, Depends(get_database)]
-# Annotated[Session, Depends(get_database)] tells FastAPI:
-# “this parameter is a Session and should be provided by get_database.”
 
 #Pydantic Schemas (for requests/responses)
 
@@ -227,132 +226,6 @@ def hello(name: str = "there"):
     message = f"Hello, {name}! Welcome to the LogLens AI API."
     return JSONResponse(content={"message": message})
 
-# SECTION: Password Hashing Utilities (NEW)
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Checks if a plain-text password matches a hashed password.
-    """
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password: str) -> str:
-    """
-    Hashes a plain-text password.
-    """
-    return pwd_context.hash(password)
-
-# SECTION: JWT Token Utilities (NEW)
-def create_access_token(
-    data: dict,
-    expires_delta: Optional[timedelta] = None,
-) -> str:
-    """
-    Creates a signed JWT access token.
-
-    - data: dictionary of claims to embed in the token (e.g. {"sub": username, "user_id": 1})
-    - expires_delta: optional timedelta for custom expiration; if not provided,
-      ACCESS_TOKEN_EXPIRE_MINUTES is used.
-    """
-    if not isinstance(data, dict):
-        raise ValueError("data passed to create_access_token must be a dict")
-
-    # Copy the input data so we don't accidentally mutate the caller's dictionary
-    to_encode = data.copy()
-
-    # Compute expiry time
-    if expires_delta is not None:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-
-    to_encode["exp"] = expire
-
-    # Encode and sign the token using our SECRET_KEY and ALGORITHM
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def decode_access_token(token: str) -> dict:
-    """
-    Decodes a JWT access token and returns its payload (data).
-    Raises JWTError if the token is invalid or expired.
-    """
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
-
-
-# SECTION: Bearer Token / Current User Dependencies
-
-bearer_scheme = HTTPBearer()
-
-
-def get_user_by_username(db: Session, username: str) -> Optional[models.User]:
-    return db.query(models.User).filter(models.User.username == username).first()
-
-
-def get_user_by_id(db: Session, user_id: int) -> Optional[models.User]:
-    return db.query(models.User).filter(models.User.id == user_id).first()
-
-
-async def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)],
-    db: DbSessionDep,
-) -> models.User:
-    """
-    Extracts the current user from the JWT access token.
-    Raises 401 if the token is invalid or user does not exist.
-    """
-    token = credentials.credentials
-
-    try:
-        payload = decode_access_token(token)
-    except HTTPException:
-        # normalize as 401 with proper header
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    username: str | None = payload.get("sub")
-    user_id: int | None = payload.get("user_id")
-
-    if username is None or user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    user = get_user_by_id(db, user_id)
-    if user is None or user.username != username:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    return user
-
-
-async def get_current_admin(
-    current_user: Annotated[models.User, Depends(get_current_user)],
-) -> models.User:
-    """
-    Ensures that the current user is an admin.
-    Raises 403 if not.
-    """
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not enough permissions (admin required)",
-        )
-    return current_user
-
-
 # SECTION: Auth Endpoints
 @app.post("/auth/signup", status_code=status.HTTP_201_CREATED)
 def signup(user_data: UserCreate, db: DbSessionDep):
@@ -388,6 +261,8 @@ def signup(user_data: UserCreate, db: DbSessionDep):
     )
 
     db.add(new_user)
+    db.flush()
+    create_personal_workspace(db, new_user)
     db.commit()
     db.refresh(new_user)
 
@@ -449,15 +324,17 @@ def read_current_user(
 def create_incident(
     payload: IncidentCreate,
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
 ):
-    """Create an incident. Replaces the old unauthenticated debug endpoint."""
+    """Create an incident in the current workspace."""
+    require_role(membership, models.WorkspaceRole.MEMBER)
     incident = models.Incident(
         title=payload.title,
         description=payload.description,
         severity=payload.severity,
         status=payload.status or models.IncidentStatus.OPEN,
-        creator_id=current_user.id,
+        creator_id=membership.user_id,
+        workspace_id=membership.workspace_id,
     )
     db.add(incident)
     db.commit()
@@ -468,11 +345,12 @@ def create_incident(
 @app.get("/incidents")
 def list_incidents(
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
     limit: int = 50,
 ):
     incidents = (
         db.query(models.Incident)
+        .filter(models.Incident.workspace_id == membership.workspace_id)
         .order_by(models.Incident.created_at.desc())
         .limit(min(limit, 200))
         .all()
@@ -484,12 +362,20 @@ def list_incidents(
 def get_incident(
     incident_id: int,
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
 ):
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
+    return _incident_to_dict(_incident_in_workspace_or_404(db, incident_id, membership.workspace_id))
+
+
+def _incident_in_workspace_or_404(db: Session, incident_id: int, workspace_id: int) -> models.Incident:
+    incident = (
+        db.query(models.Incident)
+        .filter(models.Incident.id == incident_id, models.Incident.workspace_id == workspace_id)
+        .first()
+    )
     if not incident:
-        raise HTTPException(status_code=404, detail="Incident not found.")
-    return _incident_to_dict(incident)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found.")
+    return incident
 
 
 def _incident_to_dict(i: models.Incident) -> dict:
@@ -501,17 +387,18 @@ def _incident_to_dict(i: models.Incident) -> dict:
         "severity": i.severity,
         "created_at": i.created_at.isoformat() if i.created_at else None,
         "creator_id": i.creator_id,
+        "workspace_id": i.workspace_id,
     }
 
 
 @app.get("/documents")
 def list_documents(
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
     type: Optional[str] = None,
 ):
-    """List uploaded documents, optionally filtered by type (log / runbook)."""
-    q = db.query(models.Document)
+    """List the current workspace's documents, optionally filtered by type (log / runbook)."""
+    q = db.query(models.Document).filter(models.Document.workspace_id == membership.workspace_id)
     if type:
         q = q.filter(models.Document.type == type)
     docs = q.order_by(models.Document.uploaded_at.desc()).limit(200).all()
@@ -539,6 +426,7 @@ if settings.ENABLE_DEBUG_ENDPOINTS:
     def create_debug_incident(
         db: DbSessionDep,
         current_admin: Annotated[models.User, Depends(get_current_admin)],
+        membership: MembershipDep,
     ):
         """Local testing helper. Requires an admin token even when enabled."""
         incident = models.Incident(
@@ -547,6 +435,7 @@ if settings.ENABLE_DEBUG_ENDPOINTS:
             status=models.IncidentStatus.OPEN,
             severity="SEV-3",
             creator_id=current_admin.id,
+            workspace_id=membership.workspace_id,
         )
         db.add(incident)
         db.commit()
@@ -762,6 +651,7 @@ def deserialize_embedding(stored) -> list[float]:
 def retrieve_relevant_chunks(
     db: Session,
     query: str,
+    workspace_id: int,
     top_k: int = None,
     threshold: float = None,
 ) -> list[dict]:
@@ -791,6 +681,7 @@ def retrieve_relevant_chunks(
             )
             .join(models.Document, models.Document.id == models.DocumentChunk.document_id)
             .filter(
+                models.Document.workspace_id == workspace_id,
                 models.Document.type == models.DocumentType.RUNBOOK,
                 models.DocumentChunk.embedding.isnot(None),
             )
@@ -814,6 +705,7 @@ def retrieve_relevant_chunks(
             db.query(models.DocumentChunk, models.Document)
             .join(models.Document, models.Document.id == models.DocumentChunk.document_id)
             .filter(
+                models.Document.workspace_id == workspace_id,
                 models.Document.type == models.DocumentType.RUNBOOK,
                 models.DocumentChunk.embedding.isnot(None),
             )
@@ -890,7 +782,10 @@ def retrieve_relevant_log_patterns(
             models.Document,
             models.Document.id == models.LogEntry.document_id,
         )
-        .filter(models.Document.type == models.DocumentType.LOG)
+        .filter(
+            models.Document.workspace_id == incident.workspace_id,
+            models.Document.type == models.DocumentType.LOG,
+        )
         .group_by(
             models.LogEntry.message,
             models.LogEntry.level,
@@ -974,13 +869,16 @@ async def upload_document(
     file: Annotated[UploadFile, File(...)] ,
     db: DbSessionDep,
     current_admin: Annotated[models.User, Depends(get_current_admin)],
+    membership: MembershipDep,
     ):
     """
-    Admin endpoint to upload a file.
+    Admin endpoint to upload a file into the current workspace.
 
     - For log files (.log/.jsonl/.ndjson): parses lines into LogEntry records.
     - For runbooks/docs (pdf/txt/md): parses text, chunks it, and generates embeddings for each chunk.
     """
+
+    require_role(membership, models.WorkspaceRole.ADMIN)
 
     if not file.filename:
         raise HTTPException(
@@ -1021,6 +919,7 @@ async def upload_document(
         type=doc_type,
         status="processing",
         uploader_id=current_admin.id,
+        workspace_id=membership.workspace_id,
     )
     db.add(document)
     db.commit()
@@ -1152,7 +1051,7 @@ async def upload_document(
 
 
 @app.get("/logs/{document_id}/summary", response_model=dict)
-def get_log_summary(document_id: int, db: DbSessionDep):
+def get_log_summary(document_id: int, db: DbSessionDep, membership: MembershipDep):
     """
     Retrieves a summary of log entries for a given document.
 
@@ -1163,7 +1062,11 @@ def get_log_summary(document_id: int, db: DbSessionDep):
     - Time range of logs
     """
     # Verifying document exists and is a log file
-    document = db.query(models.Document).filter(models.Document.id == document_id).first()
+    document = (
+        db.query(models.Document)
+        .filter(models.Document.id == document_id, models.Document.workspace_id == membership.workspace_id)
+        .first()
+    )
     if not document:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
     if document.type != models.DocumentType.LOG:
@@ -1226,7 +1129,7 @@ def get_log_summary(document_id: int, db: DbSessionDep):
 def search_runbooks(
     query: str,
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
     top_k: int = 5,
     threshold: float = 0.0,
 ):
@@ -1237,7 +1140,9 @@ def search_runbooks(
     the RAG endpoint cannot drift apart. Default threshold is 0.0 here because
     when you are inspecting search quality you want to see the weak matches too.
     """
-    results = retrieve_relevant_chunks(db, query, top_k=top_k, threshold=threshold)
+    results = retrieve_relevant_chunks(
+        db, query, membership.workspace_id, top_k=top_k, threshold=threshold
+    )
 
     return {
         "query": query,
@@ -1257,7 +1162,7 @@ async def ask_incident_assistant(
     incident_id: int,
     question: Annotated[str, Form(...)],
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
     top_k_chunks: int = None,
 ):
     """
@@ -1266,9 +1171,8 @@ async def ask_incident_assistant(
     Flow: retrieve -> build a numbered context block -> call the configured LLM
     -> persist the question and answer for analytics.
     """
-    incident = db.query(models.Incident).filter(models.Incident.id == incident_id).first()
-    if not incident:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found.")
+    incident = _incident_in_workspace_or_404(db, incident_id, membership.workspace_id)
+    require_role(membership, models.WorkspaceRole.MEMBER)
 
     question = question.strip()
     if not question:
@@ -1282,7 +1186,7 @@ async def ask_incident_assistant(
     # Retrieval happens off the event loop: embedding a query is CPU-bound and
     # would otherwise block every other request on this worker.
     relevant_chunks = await asyncio.to_thread(
-        retrieve_relevant_chunks, db, question, top_k
+        retrieve_relevant_chunks, db, question, incident.workspace_id, top_k
     )
 
     # Searching previously uploaded logs for related historical patterns.
@@ -1347,9 +1251,10 @@ async def ask_incident_assistant(
     # writes on every single request.
     question_log = models.QuestionLog(
         incident_id=incident_id,
-        user_id=current_user.id,
+        user_id=membership.user_id,
         question=question,
         ai_answer=result.text,
+        workspace_id=incident.workspace_id,
     )
     db.add(question_log)
     db.commit()
@@ -1383,15 +1288,17 @@ async def ask_incident_assistant(
 def submit_answer_feedback(
     feedback_data: AnswerFeedbackSubmit,
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
 ):
     """
     Allows users to submit feedback on an AI-generated answer,
     linking it directly to a specific question log entry.
     """
     # 1. Retrieve the original question log entry
+    require_role(membership, models.WorkspaceRole.MEMBER)
     question_log_entry = db.query(models.QuestionLog).filter(
-        models.QuestionLog.id == feedback_data.question_log_id
+        models.QuestionLog.id == feedback_data.question_log_id,
+        models.QuestionLog.workspace_id == membership.workspace_id,
     ).first()
 
     if not question_log_entry:
@@ -1403,7 +1310,8 @@ def submit_answer_feedback(
     # 2. Create feedback record
     new_feedback = models.AnswerFeedback(
         incident_id=question_log_entry.incident_id, # Link to the incident from the log
-        user_id=current_user.id, # The user submitting feedback
+        user_id=membership.user_id, # The user submitting feedback
+        workspace_id=membership.workspace_id,
         question=question_log_entry.question, # The original question
         answer=question_log_entry.ai_answer, # The AI's full answer from the log
         is_helpful=feedback_data.is_helpful,
@@ -1426,25 +1334,55 @@ def submit_answer_feedback(
 @app.get("/analytics/summary")
 def analytics_summary(
     db: DbSessionDep,
-    current_user: Annotated[models.User, Depends(get_current_user)],
+    membership: MembershipDep,
 ):
     """
-    Aggregate view of how the assistant is being used and whether it is helping.
+    Aggregate view of how the assistant is being used in the current workspace
+    and whether it is helping.
 
     The feedback loop only has value if you can see it, so this surfaces the
     helpful/unhelpful split alongside volume.
     """
-    total_questions = db.query(func.count(models.QuestionLog.id)).scalar() or 0
-    total_feedback = db.query(func.count(models.AnswerFeedback.id)).scalar() or 0
-    helpful = (
-        db.query(func.count(models.AnswerFeedback.id))
-        .filter(models.AnswerFeedback.is_helpful.is_(True))
+    workspace_id = membership.workspace_id
+
+    def count_documents(doc_type: str) -> int:
+        return (
+            db.query(func.count(models.Document.id))
+            .filter(models.Document.workspace_id == workspace_id, models.Document.type == doc_type)
+            .scalar()
+            or 0
+        )
+
+    total_questions = (
+        db.query(func.count(models.QuestionLog.id))
+        .filter(models.QuestionLog.workspace_id == workspace_id)
+        .scalar()
+        or 0
+    )
+    feedback = db.query(func.count(models.AnswerFeedback.id)).filter(
+        models.AnswerFeedback.workspace_id == workspace_id
+    )
+    total_feedback = feedback.scalar() or 0
+    helpful = feedback.filter(models.AnswerFeedback.is_helpful.is_(True)).scalar() or 0
+
+    total_chunks = (
+        db.query(func.count(models.DocumentChunk.id))
+        .join(models.Document, models.Document.id == models.DocumentChunk.document_id)
+        .filter(models.Document.workspace_id == workspace_id)
+        .scalar()
+        or 0
+    )
+    total_log_entries = (
+        db.query(func.count(models.LogEntry.id))
+        .join(models.Document, models.Document.id == models.LogEntry.document_id)
+        .filter(models.Document.workspace_id == workspace_id)
         .scalar()
         or 0
     )
 
     recent = (
         db.query(models.QuestionLog)
+        .filter(models.QuestionLog.workspace_id == workspace_id)
         .order_by(models.QuestionLog.answered_at.desc())
         .limit(10)
         .all()
@@ -1457,17 +1395,11 @@ def analytics_summary(
         "unhelpful_count": total_feedback - helpful,
         "helpful_rate": round(helpful / total_feedback, 3) if total_feedback else None,
         "documents": {
-            "runbooks": db.query(func.count(models.Document.id))
-            .filter(models.Document.type == models.DocumentType.RUNBOOK)
-            .scalar()
-            or 0,
-            "logs": db.query(func.count(models.Document.id))
-            .filter(models.Document.type == models.DocumentType.LOG)
-            .scalar()
-            or 0,
+            "runbooks": count_documents(models.DocumentType.RUNBOOK),
+            "logs": count_documents(models.DocumentType.LOG),
         },
-        "total_chunks": db.query(func.count(models.DocumentChunk.id)).scalar() or 0,
-        "total_log_entries": db.query(func.count(models.LogEntry.id)).scalar() or 0,
+        "total_chunks": total_chunks,
+        "total_log_entries": total_log_entries,
         "recent_questions": [
             {
                 "id": q.id,

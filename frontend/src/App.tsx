@@ -1,15 +1,21 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import './App.css'
 
 import IncidentCard from './components/IncidentCard'
 import LoginForm from './components/LoginForm'
+import WorkspaceMembers from './components/WorkspaceMembers'
+import WorkspaceSelector from './components/WorkspaceSelector'
+import { API_URL, authHeaders, errorMessage } from './api'
+import { hasRole } from './workspaceRoles'
 
 import type { Incident, IncidentListResponse } from './types/Incident'
 import type { Document, DocumentListResponse } from './types/Document'
 import type { User } from './types/User'
 import type { AnalyticsSummary } from './types/Analytics'
 import type { InvestigationResponse } from './types/Investigation'
-const API_URL = import.meta.env.VITE_API_URL || ''
+import type { Workspace, WorkspaceListResponse } from './types/Workspace'
+
+type Page = 'incidents' | 'documents' | 'analytics' | 'workspace'
 
 function App() {
   const [token, setToken] = useState<string | null>(
@@ -21,9 +27,15 @@ function App() {
   const [loginError, setLoginError] = useState('')
   const [isLoggingIn, setIsLoggingIn] = useState(false)
 
-  const [currentPage, setCurrentPage] = useState<
-    'incidents' | 'documents' | 'analytics'
-  >('incidents')
+  const [currentPage, setCurrentPage] = useState<Page>('incidents')
+
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([])
+  const [workspaceId, setWorkspaceId] = useState<number | null>(null)
+  const [workspacesError, setWorkspacesError] = useState('')
+
+  const currentWorkspace =
+    workspaces.find((workspace) => workspace.id === workspaceId) ?? null
+  const canEdit = hasRole(currentWorkspace?.role, 'member')
 
   const [incidents, setIncidents] = useState<Incident[]>([])
   const [newIncidentTitle, setNewIncidentTitle] = useState('')
@@ -117,8 +129,13 @@ function App() {
 
   function logout() {
     localStorage.removeItem('token')
+    localStorage.removeItem('workspaceId')
     setToken(null)
     setUser(null)
+
+    setWorkspaces([])
+    setWorkspaceId(null)
+    setWorkspacesError('')
 
     setIncidents([])
     setDocuments([])
@@ -149,7 +166,7 @@ function App() {
     const response = await fetch(`${API_URL}/incidents`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token, workspaceId),
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -200,7 +217,7 @@ function App() {
 
     fetch(`${API_URL}/incidents/${incidentId}`, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token, workspaceId),
       },
     })
       .then((response) => {
@@ -258,7 +275,7 @@ function App() {
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${token}`,
+          ...authHeaders(token, workspaceId),
         },
         body: formData,
       }
@@ -294,7 +311,7 @@ function App() {
     fetch(`${API_URL}/feedback`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token, workspaceId),
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -327,9 +344,7 @@ function App() {
       })
   }
 
-  function goToPage(
-    page: 'incidents' | 'documents' | 'analytics'
-  ) {
+  function goToPage(page: Page) {
     setCurrentPage(page)
 
     setSelectedIncident(null)
@@ -355,7 +370,7 @@ function App() {
 
     fetch(`${API_URL}/documents`, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token, workspaceId),
       },
     })
       .then((response) => {
@@ -396,7 +411,7 @@ function App() {
     fetch(`${API_URL}/admin/upload`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token, workspaceId),
       },
       body: formData,
     })
@@ -433,15 +448,91 @@ function App() {
       })
   }
 
+  const loadWorkspaces = useCallback(
+    (preferredId: number | null) => {
+      if (!token) {
+        return Promise.resolve()
+      }
+
+      return fetch(`${API_URL}/workspaces`, {
+        headers: authHeaders(token, null),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error('Could not load workspaces')
+          }
+
+          return response.json()
+        })
+        .then((data: WorkspaceListResponse) => {
+          const savedId =
+            preferredId ?? Number(localStorage.getItem('workspaceId'))
+          const chosen =
+            data.workspaces.find((workspace) => workspace.id === savedId) ??
+            data.workspaces[0] ??
+            null
+
+          setWorkspaces(data.workspaces)
+          setWorkspaceId(chosen ? chosen.id : null)
+          setWorkspacesError('')
+
+          if (chosen) {
+            localStorage.setItem('workspaceId', String(chosen.id))
+          }
+        })
+        .catch((error) => {
+          setWorkspacesError(error.message)
+        })
+    },
+    [token]
+  )
+
+  useEffect(() => {
+    loadWorkspaces(null)
+  }, [loadWorkspaces])
+
+  function selectWorkspace(id: number) {
+    setWorkspaceId(id)
+    localStorage.setItem('workspaceId', String(id))
+
+    setIncidents([])
+    setDocuments([])
+    setAnalytics(null)
+    setUploadMessage('')
+    setUploadError('')
+    backToIncidents()
+  }
+
+  async function createWorkspace(name: string) {
+    if (!token) {
+      return
+    }
+
+    const response = await fetch(`${API_URL}/workspaces`, {
+      method: 'POST',
+      headers: {
+        ...authHeaders(token, null),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name }),
+    })
+
+    if (!response.ok) {
+      throw new Error(await errorMessage(response, 'Could not create workspace'))
+    }
+
+    const created: Workspace = await response.json()
+    await loadWorkspaces(created.id)
+    selectWorkspace(created.id)
+  }
+
   useEffect(() => {
     if (!token) {
       return
     }
 
     fetch(`${API_URL}/me`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+      headers: authHeaders(token, null),
     })
       .then((response) => {
         if (!response.ok) {
@@ -461,7 +552,7 @@ function App() {
   }, [token])
 
   useEffect(() => {
-    if (!token || currentPage !== 'incidents') {
+    if (!token || workspaceId === null || currentPage !== 'incidents') {
       return
     }
 
@@ -470,7 +561,7 @@ function App() {
 
     fetch(`${API_URL}/incidents`, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token, workspaceId),
       },
     })
       .then((response) => {
@@ -489,18 +580,18 @@ function App() {
       .finally(() => {
         setIsLoadingIncidents(false)
       })
-  }, [token, currentPage])
+  }, [token, currentPage, workspaceId])
 
   useEffect(() => {
-    if (!token || currentPage !== 'documents') {
+    if (!token || workspaceId === null || currentPage !== 'documents') {
       return
     }
 
     loadDocuments()
-  }, [token, currentPage])
+  }, [token, currentPage, workspaceId])
 
   useEffect(() => {
-    if (!token || currentPage !== 'analytics') {
+    if (!token || workspaceId === null || currentPage !== 'analytics') {
       return
     }
 
@@ -509,7 +600,7 @@ function App() {
 
     fetch(`${API_URL}/analytics/summary`, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...authHeaders(token, workspaceId),
       },
     })
       .then((response) => {
@@ -528,7 +619,7 @@ function App() {
       .finally(() => {
         setIsLoadingAnalytics(false)
       })
-  }, [token, currentPage])
+  }, [token, currentPage, workspaceId])
 
   if (!token) {
     return (
@@ -544,6 +635,17 @@ function App() {
     <div className="app">
       <aside className="sidebar">
         <h2>LogLens AI</h2>
+
+        <WorkspaceSelector
+          workspaces={workspaces}
+          currentWorkspaceId={workspaceId}
+          onSelect={selectWorkspace}
+          onCreate={createWorkspace}
+        />
+
+        {workspacesError && (
+          <p className="workspace-error">{workspacesError}</p>
+        )}
 
         <nav>
           <button
@@ -578,6 +680,17 @@ function App() {
           >
             Analytics
           </button>
+
+          <button
+            className={
+              currentPage === 'workspace'
+                ? 'nav-button active'
+                : 'nav-button'
+            }
+            onClick={() => goToPage('workspace')}
+          >
+            Workspace
+          </button>
         </nav>
 
         <div className="sidebar-bottom">
@@ -594,6 +707,12 @@ function App() {
       </aside>
 
       <main className="main-content">
+        {currentWorkspace && (
+          <p className="workspace-context">
+            Workspace: <strong>{currentWorkspace.name}</strong>
+          </p>
+        )}
+
         {currentPage === 'incidents' && (
           <>
             {isLoadingSelectedIncident ? (
@@ -641,6 +760,11 @@ function App() {
                 <section className="investigation-section">
                   <h2>AI Investigation</h2>
 
+                  {!canEdit ? (
+                    <p className="workspace-note">
+                      Viewers can read incidents but cannot ask questions.
+                    </p>
+                  ) : (
                   <form
                     className="investigation-form"
                     onSubmit={askIncident}
@@ -668,6 +792,7 @@ function App() {
                         : 'Ask AI'}
                     </button>
                   </form>
+                  )}
 
                   {askError && (
                     <p className="error-message">{askError}</p>
@@ -783,6 +908,11 @@ function App() {
                   Select an incident to investigate logs,
                   runbooks, and likely causes.
                 </p>
+                {!canEdit ? (
+                  <p className="workspace-note">
+                    You have view-only access to this workspace.
+                  </p>
+                ) : (
                 <div className="create-incident-form">
                 <div className="create-incident-header">
                   <div>
@@ -842,6 +972,7 @@ function App() {
                   </button>
                 </div>
               </div>
+                )}
                 {isLoadingIncidents ? (
                   <p>Loading incidents...</p>
                 ) : incidentsError ? (
@@ -879,7 +1010,7 @@ function App() {
               LogLens AI.
             </p>
 
-            {user?.is_admin ? (
+            {user?.is_admin && hasRole(currentWorkspace?.role, 'admin') ? (
               <form
                 className="upload-form"
                 onSubmit={uploadDocument}
@@ -941,9 +1072,9 @@ function App() {
               </form>
             ) : (
               <p>
-                You are signed in as a standard user.
-                Document uploads require administrator
-                access.
+                Document uploads require an administrator
+                account with the admin or owner role in
+                this workspace.
               </p>
             )}
 
@@ -1090,6 +1221,31 @@ function App() {
               </>
             ) : (
               <p>No analytics available.</p>
+            )}
+          </>
+        )}
+
+        {currentPage === 'workspace' && (
+          <>
+            <h1>Workspace</h1>
+
+            {currentWorkspace ? (
+              <>
+                <p>
+                  Incidents, documents and AI answers in{' '}
+                  <strong>{currentWorkspace.name}</strong> are only
+                  visible to its members.
+                </p>
+
+                <WorkspaceMembers
+                  key={currentWorkspace.id}
+                  token={token}
+                  workspace={currentWorkspace}
+                  currentUserId={user?.id ?? null}
+                />
+              </>
+            ) : (
+              <p>No workspace selected.</p>
             )}
           </>
         )}

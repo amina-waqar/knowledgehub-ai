@@ -1559,3 +1559,162 @@ h3 {
     grid-template-columns: 1fr;
   }
 }
+
+/* =========================================
+   Workspaces
+   ========================================= */
+
+.workspace-selector {
+  display: grid;
+  gap: 6px;
+
+  margin: 0 0 26px;
+  padding: 0 8px 22px;
+
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.workspace-selector label {
+  color: #9eaaa5;
+
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.workspace-selector select,
+.workspace-selector input {
+  width: 100%;
+
+  padding: 8px 9px;
+
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 7px;
+
+  background: var(--sidebar-hover);
+  color: white;
+
+  font-size: 0.86rem;
+}
+
+.workspace-role {
+  margin: 0;
+
+  color: #9eaaa5;
+
+  font-size: 0.76rem;
+}
+
+.workspace-new-button,
+.workspace-create-actions button {
+  justify-self: start;
+
+  padding: 6px 10px;
+
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+
+  background: transparent;
+  color: #c8d0cd;
+
+  font-size: 0.8rem;
+
+  cursor: pointer;
+}
+
+.workspace-new-button:hover,
+.workspace-create-actions button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: white;
+}
+
+.workspace-create-actions button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.workspace-create-form {
+  display: grid;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.workspace-create-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.workspace-error {
+  margin: 0;
+
+  color: #f0a59d;
+
+  font-size: 0.78rem;
+}
+
+.workspace-context {
+  margin: 0 0 6px;
+
+  color: var(--ink-soft);
+
+  font-size: 0.8rem;
+}
+
+.workspace-note {
+  margin: 22px 0;
+  padding: 14px 16px;
+
+  border: 1px solid var(--border);
+  border-radius: 8px;
+
+  background: var(--surface-soft);
+  color: var(--ink-soft);
+}
+
+.workspace-members select {
+  width: 100%;
+
+  padding: 10px 12px;
+
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+
+  background: #fff;
+  color: var(--ink);
+}
+
+.member-list {
+  margin: 0;
+  padding: 0;
+
+  list-style: none;
+}
+
+.member-card {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.member-card h3 {
+  margin: 0;
+  min-width: 140px;
+}
+
+.member-remove-button {
+  margin-left: auto;
+
+  padding: 6px 12px;
+
+  border: 1px solid var(--red);
+  border-radius: 7px;
+
+  background: var(--red-soft);
+  color: var(--red);
+
+  font-size: 0.8rem;
+  font-weight: 650;
+
+  cursor: pointer;
+}

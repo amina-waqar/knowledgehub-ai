@@ -1,5 +1,5 @@
 # models.py
-from sqlalchemy import (Column, Integer, String, DateTime, ForeignKey, Text, Boolean, Float, Index,)
+from sqlalchemy import (Column, Integer, String, DateTime, ForeignKey, Text, Boolean, Float, Index, UniqueConstraint,)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -38,6 +38,47 @@ class User(Base):
     #One user can upload many documents and potentially create many incidents
     documents = relationship("Document", back_populates="uploader", cascade="all, delete-orphan")
     incidents = relationship("Incident", back_populates="creator", cascade="all, delete-orphan")
+    memberships = relationship("WorkspaceMember", back_populates="user", cascade="all, delete-orphan")
+
+
+class WorkspaceRole:
+    OWNER = "owner"
+    ADMIN = "admin"
+    MEMBER = "member"
+    VIEWER = "viewer"
+
+
+class Workspace(Base):
+    """
+    A workspace owns incidents, documents and everything derived from them.
+    Users only see data in workspaces they are members of.
+    """
+
+    __tablename__ = "workspaces"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    members = relationship("WorkspaceMember", back_populates="workspace", cascade="all, delete-orphan")
+
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    role = Column(String, nullable=False, default=WorkspaceRole.MEMBER)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    workspace = relationship("Workspace", back_populates="members")
+    user = relationship("User", back_populates="memberships")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "user_id", name="uq_workspace_member"),
+    )
 
 
 # Document model (for logs and docs)
@@ -74,6 +115,7 @@ class Document(Base):
 
     uploader_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False, index=True)
 
     # Relationships
     uploader = relationship("User", back_populates="documents")
@@ -145,6 +187,7 @@ class Incident(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     resolved_at = Column(DateTime(timezone=True), nullable=True)
     creator_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False, index=True)
 
     # Relationships
     #one user can have many incidents
@@ -203,6 +246,7 @@ class AnswerFeedback(Base):
     is_helpful = Column(Boolean, nullable=False) # True for thumbs up, False for thumbs down
     feedback_text = Column(Text, nullable=True) # Optional text comment
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False, index=True)
 
     # Relationships
     incident = relationship("Incident") # Simplified relationship, no back_populates needed for simple feedback
@@ -222,6 +266,7 @@ class QuestionLog(Base):
     question = Column(Text, nullable=False)
     ai_answer = Column(Text, nullable=True)
     answered_at = Column(DateTime(timezone=True), server_default=func.now())
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False, index=True)
 
     incident = relationship("Incident")
     user = relationship("User")
